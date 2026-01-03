@@ -171,7 +171,7 @@ void WeatherUI::ShowIdleCard(const IdleCardInfo& info) {
         }
         if (!info.humidity_text.empty()) {
             if (!detail.empty()) detail += "  |  ";
-            detail += "Độ ẩm: " + info.humidity_text;
+            detail += "Humidity: " + info.humidity_text;
         }
         if (!info.feels_like_text.empty()) {
             if (!detail.empty()) detail += "  |  ";
@@ -235,13 +235,13 @@ void WeatherUI::UpdateIdleDisplay(const WeatherInfo& weather_info) {
         card.humidity_text = std::to_string(weather_info.humidity) + "%";
 
         char extra_buf[32];
-        snprintf(extra_buf, sizeof(extra_buf), "Cảm giác như: %d°C", (int)round(weather_info.feels_like));
+        snprintf(extra_buf, sizeof(extra_buf), "Feels like: %d°C", (int)round(weather_info.feels_like));
         card.feels_like_text = extra_buf;
         
-        snprintf(extra_buf, sizeof(extra_buf), "Gió: %.1f m/s", weather_info.wind_speed);
+        snprintf(extra_buf, sizeof(extra_buf), "Wind: %.1f m/s", weather_info.wind_speed);
         card.wind_text = extra_buf;
         
-        snprintf(extra_buf, sizeof(extra_buf), "Áp suất: %d hPa", weather_info.pressure);
+        snprintf(extra_buf, sizeof(extra_buf), "Pressure: %d hPa", weather_info.pressure);
         card.pressure_text = extra_buf;
 
         card.icon = GetWeatherIcon(weather_info.icon_code);

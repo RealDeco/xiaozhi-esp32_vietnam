@@ -158,14 +158,14 @@ bool WeatherService::FetchWeatherData() {
         }
 
         if (city.empty() || city == "auto") {
-            ESP_LOGW(TAG, "Failed to detect IP location, fallback to Hanoi");
+            ESP_LOGW(TAG, "Failed to detect IP location, fallback to Copenhagen");
             city = CITY_LOCATION_DEFAULT;
         }
     }
 
     // Call OpenWeatherMap API
     std::string url = std::string(WEATHER_API_ENDPOINT) + "?q=" + UrlEncode(city) +
-                      "&appid=" + api_key + "&units=metric&lang=vi";
+                      "&appid=" + api_key + "&units=metric&lang=en";
 
     ESP_LOGI(TAG, "Fetching weather from: %s", url.c_str());
 
