@@ -23,6 +23,7 @@
 #include <esp_lcd_touch_cst9217.h>
 #include <esp_lvgl_port.h>
 #include <lvgl.h>
+#include <esp_timer.h>
 
 #define TAG "WaveshareEsp32s3TouchAMOLED1inch75"
 
@@ -50,13 +51,13 @@ public:
         WriteReg(0x64, 0x02); // CV charger voltage setting to 4.1V
 
         WriteReg(0x61, 0x02); // set Main battery precharge current to 50mA
-        WriteReg(0x62, 0x08); // set Main battery charger current to 400mA ( 0x08-200mA, 0x09-300mA, 0x0A-400mA )
+        WriteReg(0x62, 0x08); // set Main battery charger current to 400mA
         WriteReg(0x63, 0x01); // set Main battery term charge current to 25mA
     }
 };
 
-#define LCD_OPCODE_WRITE_CMD (0x02ULL)
-#define LCD_OPCODE_READ_CMD (0x03ULL)
+#define LCD_OPCODE_WRITE_CMD   (0x02ULL)
+#define LCD_OPCODE_READ_CMD    (0x03ULL)
 #define LCD_OPCODE_WRITE_COLOR (0x32ULL)
 
 static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
@@ -78,21 +79,17 @@ static const sh8601_lcd_init_cmd_t vendor_specific_init[] = {
     {0x29, NULL, 0, 0},
 };
 
-// 在waveshare_amoled_1_75类之前添加新的显示类
 class CustomLcdDisplay : public SpiLcdDisplay {
 public:
     static void rounder_event_cb(lv_event_t* e) {
-        lv_area_t* area = (lv_area_t* )lv_event_get_param(e);
+        lv_area_t* area = (lv_area_t*)lv_event_get_param(e);
         uint16_t x1 = area->x1;
         uint16_t x2 = area->x2;
-
         uint16_t y1 = area->y1;
         uint16_t y2 = area->y2;
 
-        // round the start of coordinate down to the nearest 2M number
         area->x1 = (x1 >> 1) << 1;
         area->y1 = (y1 >> 1) << 1;
-        // round the end of coordinate up to the nearest 2N+1 number
         area->x2 = ((x2 >> 1) << 1) + 1;
         area->y2 = ((y2 >> 1) << 1) + 1;
     }
@@ -109,8 +106,8 @@ public:
         : SpiLcdDisplay(io_handle, panel_handle,
                         width, height, offset_x, offset_y, mirror_x, mirror_y, swap_xy) {
         DisplayLockGuard lock(this);
-        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES*  0.1, 0);
-        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES*  0.1, 0);
+        lv_obj_set_style_pad_left(status_bar_, LV_HOR_RES * 0.1, 0);
+        lv_obj_set_style_pad_right(status_bar_, LV_HOR_RES * 0.1, 0);
         lv_display_add_event_cb(display_, rounder_event_cb, LV_EVENT_INVALIDATE_AREA, NULL);
     }
 };
@@ -122,14 +119,17 @@ public:
 protected:
     esp_lcd_panel_io_handle_t panel_io_;
 
-    virtual void SetBrightnessImpl(uint8_t brightness) override {
+    void SetBrightnessImpl(uint8_t brightness) override {
         auto display = Board::GetInstance().GetDisplay();
         DisplayLockGuard lock(display);
-        uint8_t data[1] = {((uint8_t)((255*  brightness) / 100))};
+
+        uint8_t data[1] = { (uint8_t)((255 * brightness) / 100) };
+
         int lcd_cmd = 0x51;
         lcd_cmd &= 0xff;
         lcd_cmd <<= 8;
-        lcd_cmd |= LCD_OPCODE_WRITE_CMD << 24;
+        lcd_cmd |= (LCD_OPCODE_WRITE_CMD << 24);
+
         esp_lcd_panel_io_tx_param(panel_io_, lcd_cmd, &data, sizeof(data));
     }
 };
@@ -139,26 +139,246 @@ private:
     i2c_master_bus_handle_t i2c_bus_;
     Pmic* pmic_ = nullptr;
     Button boot_button_;
-    CustomLcdDisplay* display_;
-    CustomBacklight* backlight_;
+    CustomLcdDisplay* display_ = nullptr;
+    CustomBacklight* backlight_ = nullptr;
     esp_io_expander_handle_t io_expander = NULL;
-    PowerSaveTimer* power_save_timer_;
+    PowerSaveTimer* power_save_timer_ = nullptr;
+
+    // ---- Swipe/tap detector ----
+    esp_timer_handle_t swipe_timer_ = nullptr;
+
+    struct TouchState {
+        bool touching = false;
+        int start_x = -1;
+        int start_y = -1;
+        int last_x = -1;
+        int last_y = -1;
+        int64_t start_ms = 0;
+    };
+
+    TouchState touch_;
+
+    static int64_t now_ms() {
+        return esp_timer_get_time() / 1000;
+    }
+
+    static int iabs(int v) { return v < 0 ? -v : v; }
+
+    static lv_indev_t* find_pointer_indev() {
+        lv_indev_t* indev = NULL;
+        while ((indev = lv_indev_get_next(indev)) != NULL) {
+            if (lv_indev_get_type(indev) == LV_INDEV_TYPE_POINTER) {
+                return indev;
+            }
+        }
+        return NULL;
+    }
+
+    // ---- Actions executed on LVGL task via lv_async_call ----
+    enum class ActionType {
+        None,
+        BrightnessUp,
+        BrightnessDown,
+        VolumeUp,
+        VolumeDown,
+        TapToggleChat,
+    };
+
+    struct Action {
+        WaveshareEsp32s3TouchAMOLED1inch75* self;
+        ActionType type;
+    };
+
+    static void action_async_cb(void* p) {
+        Action* a = (Action*)p;
+        auto* self = a->self;
+
+        switch (a->type) {
+            case ActionType::BrightnessUp: {
+                auto bl = self->GetBacklight();
+                int b = bl->brightness();
+                int nb = b + 5;
+                if (nb > 100) nb = 100;
+                bl->SetBrightness(nb);
+                self->GetDisplay()->ShowNotification("Brightness: " + std::to_string(nb));
+                break;
+            }
+            case ActionType::BrightnessDown: {
+                auto bl = self->GetBacklight();
+                int b = bl->brightness();
+                int nb = b - 5;
+                if (nb < 0) nb = 0;
+                bl->SetBrightness(nb);
+                self->GetDisplay()->ShowNotification("Brightness: " + std::to_string(nb));
+                break;
+            }
+            case ActionType::VolumeUp: {
+                auto codec = self->GetAudioCodec();
+                int v = codec->output_volume();
+                int nv = v + 5;
+                if (nv > 100) nv = 100;
+                codec->SetOutputVolume(nv);
+                self->GetDisplay()->ShowNotification("Volume: " + std::to_string(nv));
+                break;
+            }
+            case ActionType::VolumeDown: {
+                auto codec = self->GetAudioCodec();
+                int v = codec->output_volume();
+                int nv = v - 5;
+                if (nv < 0) nv = 0;
+                codec->SetOutputVolume(nv);
+                self->GetDisplay()->ShowNotification("Volume: " + std::to_string(nv));
+                break;
+            }
+            case ActionType::TapToggleChat: {
+                // Same behavior as the BOOT click handler
+                auto& app = Application::GetInstance();
+                if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
+                    self->ResetWifiConfiguration();
+                }
+                app.ToggleChatState();
+                break;
+            }
+            default:
+                break;
+        }
+
+        delete a;
+    }
+
+    void QueueAction(ActionType t) {
+        auto* a = new Action{ this, t };
+        lv_async_call(action_async_cb, a);
+    }
+
+    void HandleTouchEnd(int dx, int dy, int64_t dur_ms) {
+        // Tap thresholds
+        const int TAP_MAX_MOVE = 15;       // px
+        const int TAP_MAX_TIME = 300;      // ms
+
+        // Swipe thresholds
+        const int SWIPE_MIN_DIST = 40;     // px
+        const int SWIPE_MAX_TIME = 900;    // ms
+
+        int adx = iabs(dx);
+        int ady = iabs(dy);
+
+        // TAP
+        if (dur_ms <= TAP_MAX_TIME && adx <= TAP_MAX_MOVE && ady <= TAP_MAX_MOVE) {
+            QueueAction(ActionType::TapToggleChat);
+            return;
+        }
+
+        // SWIPE
+        if (dur_ms > SWIPE_MAX_TIME) return;
+        if (adx < SWIPE_MIN_DIST && ady < SWIPE_MIN_DIST) return;
+
+        // Determine direction (dominant axis)
+        if (adx >= ady) {
+            // HORIZONTAL → Brightness
+            if (dx > 0) {
+                // RIGHT
+                QueueAction(ActionType::BrightnessUp);
+            } else {
+                // LEFT
+                QueueAction(ActionType::BrightnessDown);
+            }
+        } else {
+            // VERTICAL → Volume
+            if (dy > 0) {
+                // DOWN
+                QueueAction(ActionType::VolumeDown);
+            } else {
+                // UP
+                QueueAction(ActionType::VolumeUp);
+            }
+        }
+    }
+
+    static void swipe_timer_cb(void* arg) {
+        auto* self = (WaveshareEsp32s3TouchAMOLED1inch75*)arg;
+
+        // Keep LVGL lock time extremely short
+        if (!lvgl_port_lock(0)) {
+            return;
+        }
+
+        lv_indev_t* indev = find_pointer_indev();
+        if (!indev) {
+            lvgl_port_unlock();
+            return;
+        }
+
+        lv_point_t p;
+        lv_indev_get_point(indev, &p);
+        lv_indev_state_t st = lv_indev_get_state(indev);
+
+        lvgl_port_unlock();
+
+        if (st == LV_INDEV_STATE_PRESSED) {
+            int x = p.x;
+            int y = p.y;
+
+            if (!self->touch_.touching) {
+                self->touch_.touching = true;
+                self->touch_.start_x = x;
+                self->touch_.start_y = y;
+                self->touch_.last_x = x;
+                self->touch_.last_y = y;
+                self->touch_.start_ms = now_ms();
+            } else {
+                self->touch_.last_x = x;
+                self->touch_.last_y = y;
+            }
+        } else {
+            if (self->touch_.touching) {
+                self->touch_.touching = false;
+
+                int dx = self->touch_.last_x - self->touch_.start_x;
+                int dy = self->touch_.last_y - self->touch_.start_y;
+                int64_t dur = now_ms() - self->touch_.start_ms;
+
+                self->HandleTouchEnd(dx, dy, dur);
+            }
+        }
+    }
+
+    void InitializeSwipeDetector() {
+        esp_timer_create_args_t timer_args = {
+            .callback = swipe_timer_cb,
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "touch_gest",
+            .skip_unhandled_events = true,
+        };
+
+        ESP_ERROR_CHECK(esp_timer_create(&timer_args, &swipe_timer_));
+
+        // Lighter on audio: 120ms polling (tune if you want)
+        //  - 80ms = more responsive, slightly more CPU
+        //  - 120ms = usually enough for swipes/taps, easier on audio
+        const int PERIOD_US = 120 * 1000;
+        ESP_ERROR_CHECK(esp_timer_start_periodic(swipe_timer_, PERIOD_US));
+        ESP_LOGI(TAG, "Touch gesture poller started (%d ms)", PERIOD_US / 1000);
+    }
 
     void InitializePowerSaveTimer() {
         power_save_timer_ = new PowerSaveTimer(-1, 60, 300);
         power_save_timer_->OnEnterSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(true);
-            GetBacklight()->SetBrightness(20); });
+            GetBacklight()->SetBrightness(20);
+        });
         power_save_timer_->OnExitSleepMode([this]() {
             GetDisplay()->SetPowerSaveMode(false);
-            GetBacklight()->RestoreBrightness(); });
-        power_save_timer_->OnShutdownRequest([this](){ 
-            pmic_->PowerOff(); });
+            GetBacklight()->RestoreBrightness();
+        });
+        power_save_timer_->OnShutdownRequest([this]() {
+            pmic_->PowerOff();
+        });
         power_save_timer_->SetEnabled(true);
     }
 
     void InitializeCodecI2c() {
-        // Initialize I2C peripheral
         i2c_master_bus_config_t i2c_bus_cfg = {
             .i2c_port = I2C_NUM_0,
             .sda_io_num = AUDIO_CODEC_I2C_SDA_PIN,
@@ -173,8 +393,9 @@ private:
 
     void InitializeTca9554(void) {
         esp_err_t ret = esp_io_expander_new_i2c_tca9554(i2c_bus_, I2C_ADDRESS, &io_expander);
-        if (ret != ESP_OK)
+        if (ret != ESP_OK) {
             ESP_LOGE(TAG, "TCA9554 create returned error");
+        }
         ret = esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_4, IO_EXPANDER_INPUT);
         ESP_ERROR_CHECK(ret);
     }
@@ -191,7 +412,7 @@ private:
         buscfg.data1_io_num = EXAMPLE_PIN_NUM_LCD_DATA1;
         buscfg.data2_io_num = EXAMPLE_PIN_NUM_LCD_DATA2;
         buscfg.data3_io_num = EXAMPLE_PIN_NUM_LCD_DATA3;
-        buscfg.max_transfer_sz = DISPLAY_WIDTH*  DISPLAY_HEIGHT*  sizeof(uint16_t);
+        buscfg.max_transfer_sz = DISPLAY_WIDTH * DISPLAY_HEIGHT * sizeof(uint16_t);
         buscfg.flags = SPICOMMON_BUSFLAG_QUAD;
         ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
     }
@@ -219,7 +440,6 @@ private:
         esp_lcd_panel_io_handle_t panel_io = nullptr;
         esp_lcd_panel_handle_t panel = nullptr;
 
-        // 液晶屏控制IO初始化
         ESP_LOGD(TAG, "Install panel IO");
         esp_lcd_panel_io_spi_config_t io_config = SH8601_PANEL_IO_QSPI_CONFIG(
             EXAMPLE_PIN_NUM_LCD_CS,
@@ -227,20 +447,21 @@ private:
             nullptr);
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI2_HOST, &io_config, &panel_io));
 
-        // 初始化液晶屏驱动芯片
         ESP_LOGD(TAG, "Install LCD driver");
         const sh8601_vendor_config_t vendor_config = {
             .init_cmds = &vendor_specific_init[0],
             .init_cmds_size = sizeof(vendor_specific_init) / sizeof(sh8601_lcd_init_cmd_t),
             .flags = {
                 .use_qspi_interface = 1,
-            }};
+            }
+        };
 
         esp_lcd_panel_dev_config_t panel_config = {};
         panel_config.reset_gpio_num = EXAMPLE_PIN_NUM_LCD_RST;
         panel_config.rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB;
         panel_config.bits_per_pixel = 16;
-        panel_config.vendor_config = (void* )&vendor_config;
+        panel_config.vendor_config = (void*)&vendor_config;
+
         ESP_ERROR_CHECK(esp_lcd_new_panel_sh8601(panel_io, &panel_config, &panel));
         esp_lcd_panel_set_gap(panel, 0x06, 0);
         esp_lcd_panel_reset(panel);
@@ -248,19 +469,37 @@ private:
         esp_lcd_panel_invert_color(panel, false);
         esp_lcd_panel_mirror(panel, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y);
         esp_lcd_panel_disp_on_off(panel, true);
+
         display_ = new CustomLcdDisplay(panel_io, panel,
-                                        DISPLAY_WIDTH, DISPLAY_HEIGHT, DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y, DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y, DISPLAY_SWAP_XY);
+                                        DISPLAY_WIDTH, DISPLAY_HEIGHT,
+                                        DISPLAY_OFFSET_X, DISPLAY_OFFSET_Y,
+                                        DISPLAY_MIRROR_X, DISPLAY_MIRROR_Y,
+                                        DISPLAY_SWAP_XY);
+
         backlight_ = new CustomBacklight(panel_io);
         backlight_->RestoreBrightness();
     }
 
     void InitializeTouch() {
+        ESP_LOGI(TAG, "Initializing CST9217 touch");
+
+        // Manual reset
+        gpio_config_t rst_cfg = {};
+        rst_cfg.pin_bit_mask = BIT64(TOUCH_RST_PIN);
+        rst_cfg.mode = GPIO_MODE_OUTPUT;
+        gpio_config(&rst_cfg);
+
+        gpio_set_level(TOUCH_RST_PIN, 0);
+        vTaskDelay(pdMS_TO_TICKS(10));
+        gpio_set_level(TOUCH_RST_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+
         esp_lcd_touch_handle_t tp;
         esp_lcd_touch_config_t tp_cfg = {
             .x_max = DISPLAY_WIDTH - 1,
             .y_max = DISPLAY_HEIGHT - 1,
-            .rst_gpio_num = GPIO_NUM_40,
-            .int_gpio_num = GPIO_NUM_NC,
+            .rst_gpio_num = GPIO_NUM_NC,
+            .int_gpio_num = TOUCH_INT_PIN,
             .levels = {
                 .reset = 0,
                 .interrupt = 0,
@@ -271,27 +510,31 @@ private:
                 .mirror_y = 1,
             },
         };
+
         esp_lcd_panel_io_handle_t tp_io_handle = NULL;
         esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST9217_CONFIG();
-        tp_io_config.scl_speed_hz = 400*  1000;
+        tp_io_config.dev_addr = TOUCH_I2C_ADDR;
+        tp_io_config.scl_speed_hz = 400 * 1000;
+
         ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus_, &tp_io_config, &tp_io_handle));
-        ESP_LOGI(TAG, "Initialize touch controller");
         ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst9217(tp_io_handle, &tp_cfg, &tp));
+
         const lvgl_port_touch_cfg_t touch_cfg = {
             .disp = lv_display_get_default(),
             .handle = tp,
         };
         lvgl_port_add_touch(&touch_cfg);
-        ESP_LOGI(TAG, "Touch panel initialized successfully");
+
+        ESP_LOGI(TAG, "✅ CST9217 touch initialized");
     }
 
-    // 初始化工具
     void InitializeTools() {
-        auto &mcp_server = McpServer::GetInstance();
+        auto& mcp_server = McpServer::GetInstance();
         mcp_server.AddTool("self.system.reconfigure_wifi",
             "Reboot the device and enter WiFi configuration mode.\n"
             "**CAUTION** You must ask the user to confirm this action.",
-            PropertyList(), [this](const PropertyList& properties) {
+            PropertyList(),
+            [this](const PropertyList&) {
                 ResetWifiConfiguration();
                 return true;
             });
@@ -306,52 +549,48 @@ public:
         InitializeSpi();
         InitializeSH8601Display();
         InitializeTouch();
+
+        // Poller does swipe + tap; actions run on LVGL task
+        InitializeSwipeDetector();
+
         InitializeButtons();
         InitializeTools();
     }
 
-    virtual AudioCodec* GetAudioCodec() override {
+    AudioCodec* GetAudioCodec() override {
         static BoxAudioCodec audio_codec(
-            i2c_bus_, 
-            AUDIO_INPUT_SAMPLE_RATE, 
+            i2c_bus_,
+            AUDIO_INPUT_SAMPLE_RATE,
             AUDIO_OUTPUT_SAMPLE_RATE,
-            AUDIO_I2S_GPIO_MCLK, 
-            AUDIO_I2S_GPIO_BCLK, 
-            AUDIO_I2S_GPIO_WS, 
-            AUDIO_I2S_GPIO_DOUT, 
+            AUDIO_I2S_GPIO_MCLK,
+            AUDIO_I2S_GPIO_BCLK,
+            AUDIO_I2S_GPIO_WS,
+            AUDIO_I2S_GPIO_DOUT,
             AUDIO_I2S_GPIO_DIN,
-            AUDIO_CODEC_PA_PIN, 
-            AUDIO_CODEC_ES8311_ADDR, 
-            AUDIO_CODEC_ES7210_ADDR, 
+            AUDIO_CODEC_PA_PIN,
+            AUDIO_CODEC_ES8311_ADDR,
+            AUDIO_CODEC_ES7210_ADDR,
             AUDIO_INPUT_REFERENCE);
         return &audio_codec;
     }
 
-    virtual Display* GetDisplay() override {
-        return display_;
-    }
+    Display* GetDisplay() override { return display_; }
+    Backlight* GetBacklight() override { return backlight_; }
 
-    virtual Backlight* GetBacklight() override {
-        return backlight_;
-    }
-
-    virtual bool GetBatteryLevel(int &level, bool &charging, bool &discharging) override {
+    bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
         static bool last_discharging = false;
         charging = pmic_->IsCharging();
         discharging = pmic_->IsDischarging();
-        if (discharging != last_discharging)
-        {
+        if (discharging != last_discharging) {
             power_save_timer_->SetEnabled(discharging);
             last_discharging = discharging;
         }
-
         level = pmic_->GetBatteryLevel();
         return true;
     }
 
-    virtual void SetPowerSaveMode(bool enabled) override {
-        if (!enabled)
-        {
+    void SetPowerSaveMode(bool enabled) override {
+        if (!enabled) {
             power_save_timer_->WakeUp();
         }
         WifiBoard::SetPowerSaveMode(enabled);

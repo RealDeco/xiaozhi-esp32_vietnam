@@ -483,34 +483,127 @@ private:
     static void touchpad_timer_callback(void* arg) {
         auto& board = (TaijiPiS3Board&)Board::GetInstance();
         auto touchpad = board.GetTouchpad();
+
+        // Tuning knobs
+        const int64_t LONG_PRESS_MS = 500;     // long press threshold
+        const int64_t MAX_SWIPE_MS = 900;      // optional: ignore very slow swipes
+        const int SWIPE_PX = 40;               // swipe distance threshold (try 30..60)
+        const int MOVE_DEADZONE_PX = 8;        // jitter deadzone while finger is down
+
         static bool was_touched = false;
         static int64_t touch_start_time = 0;
-        const int64_t TOUCH_THRESHOLD_MS = 500;  // 触摸时长阈值，超过500ms视为长按
-        
+
+        static int start_x = -1;
+        static int start_y = -1;
+        static int last_x = -1;
+        static int last_y = -1;
+        static bool moved = false;
+
         touchpad->UpdateTouchPoint();
         auto touch_point = touchpad->GetTouchPoint();
-        
-        // 检测触摸开始
+
+        int64_t now_ms = esp_timer_get_time() / 1000;
+
+        // Touch start
         if (touch_point.num > 0 && !was_touched) {
             was_touched = true;
-            touch_start_time = esp_timer_get_time() / 1000; // 转换为毫秒
-        } 
-        // 检测触摸释放
-        else if (touch_point.num == 0 && was_touched) {
+            moved = false;
+
+            touch_start_time = now_ms;
+            start_x = last_x = touch_point.x;
+            start_y = last_y = touch_point.y;
+            return;
+        }
+
+        // Touch move (finger still down)
+        if (touch_point.num > 0 && was_touched) {
+            int dx = touch_point.x - start_x;
+            int dy = touch_point.y - start_y;
+
+            // Mark as "moved" once we exceed a small deadzone (avoid jitter cancelling taps)
+            if (!moved && (abs(dx) > MOVE_DEADZONE_PX || abs(dy) > MOVE_DEADZONE_PX)) {
+                moved = true;
+            }
+
+            last_x = touch_point.x;
+            last_y = touch_point.y;
+            return;
+        }
+
+        // Touch release
+        if (touch_point.num == 0 && was_touched) {
             was_touched = false;
-            int64_t touch_duration = (esp_timer_get_time() / 1000) - touch_start_time;
-            
-            // 只有短触才触发
-            if (touch_duration < TOUCH_THRESHOLD_MS) {
+
+            int64_t touch_duration = now_ms - touch_start_time;
+
+            int dx = last_x - start_x;
+            int dy = last_y - start_y;
+            int adx = abs(dx);
+            int ady = abs(dy);
+
+            bool is_swipe = moved &&
+                            (touch_duration <= MAX_SWIPE_MS) &&
+                            (adx >= SWIPE_PX || ady >= SWIPE_PX);
+
+            // Swipe handling
+            if (is_swipe) {
+                if (adx > ady) {
+                    // Horizontal swipe -> brightness (REVERSED)
+                    auto backlight = board.GetBacklight();
+                    int b = backlight->brightness();
+
+                    if (dx > 0) {
+                        // dx > 0 (was "right") -> brightness DOWN
+                        int nb = b - 5;
+                        if (nb < 0) nb = 0;
+                        backlight->SetBrightness(nb);
+                        board.GetDisplay()->ShowNotification("Brightness: " + std::to_string(nb));
+                    } else {
+                        // dx < 0 (was "left") -> brightness UP
+                        int nb = b + 5;
+                        if (nb > 100) nb = 100;
+                        backlight->SetBrightness(nb);
+                        board.GetDisplay()->ShowNotification("Brightness: " + std::to_string(nb));
+                    }
+                } else {
+                    // Vertical swipe -> volume (REVERSED)
+                    auto codec = board.GetAudioCodec();
+                    int v = codec->output_volume();
+
+                    if (dy > 0) {
+                        // dy > 0 (was "down") -> volume UP
+                        v += 5;
+                        if (v > 100) v = 100;
+                    } else {
+                        // dy < 0 (was "up") -> volume DOWN
+                        v -= 5;
+                        if (v < 0) v = 0;
+                    }
+
+                    codec->SetOutputVolume(v);
+                    board.GetDisplay()->ShowNotification("Volume: " + std::to_string(v));
+                }
+                return;
+            }
+
+            // Tap / long press (keep your existing tap behavior)
+            if (touch_duration < LONG_PRESS_MS) {
                 auto& app = Application::GetInstance();
-                if (app.GetDeviceState() == kDeviceStateStarting && 
+                if (app.GetDeviceState() == kDeviceStateStarting &&
                     !WifiStation::GetInstance().IsConnected()) {
                     board.ResetWifiConfiguration();
                 }
                 app.ToggleChatState();
+            } else {
+                // Optional long press behavior (uncomment if you want)
+                // board.GetAudioCodec()->SetOutputVolume(0);
+                // board.GetDisplay()->ShowNotification("Muted");
             }
         }
     }
+
+
+
 
     void InitializeCst816sTouchPad() {
         ESP_LOGI(TAG, "Init Cst816s");
