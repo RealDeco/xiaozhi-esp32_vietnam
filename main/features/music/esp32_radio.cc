@@ -100,6 +100,7 @@ radio_stations_["SMOOTH_CHILL"]   = RadioStation("Smooth Chill",        "https:/
 radio_stations_["Q_RADIO"]        = RadioStation("Q Radio",             "https://edge-audio-04-thn.sharp-stream.com/qr1029mobile.mp3", "Better Music, Less Talk", "Pop",       1.0f);
 
     // Swedish MP3 streams
+radio_stations_["NRJ_FM"]           = RadioStation("Swedish NRJ FM",    "https://edge-bauerse-02-thn.sharp-stream.com/nrj_instreamtest_se_mp3", "Swedish NRJ Radio", "Pop/Dance", 1.0f);
 radio_stations_["SRP1"]           = RadioStation("Swedish P1",          "https://http-live.sr.se/p1-mp3-192",                     "Swedish Radio P1",        "News/Talk",      1.0f);
 radio_stations_["SRP3"]           = RadioStation("Swedish P3",          "https://http-live.sr.se/p3-mp3-192",                     "Swedish Radio P3",        "Pop",            1.0f);
 radio_stations_["SRP4"]           = RadioStation("Swedish P4",          "https://http-live.sr.se/p4malmo-mp3-192",                "Swedish Radio P4 Malmö",  "Regional",       1.0f);
@@ -110,6 +111,7 @@ radio_stations_["RETRO"]          = RadioStation("Swedish Retro FM",    "https:/
 radio_stations_["1MIX"]           = RadioStation("1Mix Radio",          "http://fr1.1mix.co.uk:8060/128b",                        "1Mix Radio",              "Electronic",     1.0f);
 radio_stations_["PSYRADIO"]       = RadioStation("Psyradio",            "http://komplex2.psyradio.org:8040/stream",               "Psyradio",                "Psytrance",      1.0f);
 radio_stations_["BRIGADA"]        = RadioStation("Brigada News",        "https://makatistream.brigadanews.ph",        "Brigada News FM Philippines Makati",  "News/Talk",      1.5f);
+radio_stations_["K-POP"]        = RadioStation("Only Hit - KPop",        "https://ais-sa3.cdnstream1.com/2630_128.mp3",        "K-POP",  "Pop",      1.5f);
 
 
     ESP_LOGI(TAG, "Initialized %d radio stations (MP3)", (int)radio_stations_.size());
