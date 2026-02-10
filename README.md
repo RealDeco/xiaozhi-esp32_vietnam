@@ -47,4 +47,3 @@ Fork of xiaozhi-esp32_vietnam changed to english and radio channels added:
 
 ---
 
-**Would you like me to sort these alphabetically or group them differently for you?**
