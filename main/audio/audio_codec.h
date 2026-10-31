@@ -20,6 +20,7 @@ public:
     virtual ~AudioCodec();
     
     virtual void SetOutputVolume(int volume);
+    virtual void Unmute();
     virtual void SetInputGain(float gain);
     virtual void EnableInput(bool enable);
     virtual void EnableOutput(bool enable);
@@ -55,6 +56,7 @@ protected:
     int input_channels_ = 1;
     int output_channels_ = 1;
     int output_volume_ = 70;
+    int last_unmuted_volume_ = 70;  // Level to restore when unmuting
     float input_gain_ = 0.0;
 
     virtual int Read(int16_t* dest, int samples) = 0;

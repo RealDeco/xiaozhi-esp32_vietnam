@@ -453,6 +453,7 @@ std::unique_ptr<AudioStreamPacket> AudioService::PopWakeWordPacket() {
 }
 
 void AudioService::EnableWakeWordDetection(bool enable) {
+#if !CONFIG_WAKE_WORD_DISABLED
     if (!wake_word_) {
         return;
     }
@@ -472,6 +473,7 @@ void AudioService::EnableWakeWordDetection(bool enable) {
         wake_word_->Stop();
         xEventGroupClearBits(event_group_, AS_EVENT_WAKE_WORD_RUNNING);
     }
+#endif
 }
 
 void AudioService::EnableVoiceProcessing(bool enable) {

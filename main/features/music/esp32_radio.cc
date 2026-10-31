@@ -19,13 +19,60 @@
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
+#include <cJSON.h>
+#include "settings.h"
+
 #define TAG "Esp32Radio"
+
+// The built-in LVGL text fonts (font_puhui_basic_*) contain no Cyrillic glyphs,
+// so Russian station names would render as blank boxes on the LCD.
+// Transliterate Cyrillic to Latin for on-screen text only (web UI and voice
+// control keep using the original Russian names).
+static std::string ToDisplayAsciiImpl(const std::string& in) {
+    static const char* kUpper[32] = {
+        "A", "B", "V", "G", "D", "E", "Zh", "Z", "I", "Y", "K", "L", "M", "N",
+        "O", "P", "R", "S", "T", "U", "F", "Kh", "Ts", "Ch", "Sh", "Shch",
+        "", "Y", "", "E", "Yu", "Ya"
+    };
+    static const char* kLower[32] = {
+        "a", "b", "v", "g", "d", "e", "zh", "z", "i", "y", "k", "l", "m", "n",
+        "o", "p", "r", "s", "t", "u", "f", "kh", "ts", "ch", "sh", "shch",
+        "", "y", "", "e", "yu", "ya"
+    };
+
+    std::string out;
+    out.reserve(in.size() + 16);
+    size_t i = 0;
+    while (i < in.size()) {
+        unsigned char c = static_cast<unsigned char>(in[i]);
+        if (c == 0xD0 && i + 1 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            if (d == 0x81) { out += "Yo"; i += 2; continue; }          // Ё
+            if (d >= 0x90 && d <= 0xAF) { out += kUpper[d - 0x90]; i += 2; continue; }
+        } else if (c == 0xD1 && i + 1 < in.size()) {
+            unsigned char d = static_cast<unsigned char>(in[i + 1]);
+            if (d == 0x91) { out += "yo"; i += 2; continue; }          // ё
+            if (d >= 0x80 && d <= 0xAF) { out += kLower[d - 0x80]; i += 2; continue; }
+        }
+        if (c < 0x80) {
+            out.push_back(static_cast<char>(c));
+        }
+        // Non-ASCII characters without a glyph in the built-in font are dropped.
+        ++i;
+    }
+    return out;
+}
+
+std::string Esp32Radio::ToDisplayAscii(const std::string& text) {
+    return ToDisplayAsciiImpl(text);
+}
 
 Esp32Radio::Esp32Radio()
     : current_station_name_()
     , current_station_url_()
     , station_name_displayed_(false)
     , current_station_volume_(1.0f)
+    , current_station_codec_(STATION_CODEC_MP3)
     , radio_stations_()
     , display_mode_(DISPLAY_MODE_SPECTRUM)
     , is_playing_(false)
@@ -113,8 +160,16 @@ radio_stations_["PSYRADIO"]       = RadioStation("Psyradio",            "http://
 radio_stations_["BRIGADA"]        = RadioStation("Brigada News",        "https://makatistream.brigadanews.ph",        "Brigada News FM Philippines Makati",  "News/Talk",      1.5f);
 radio_stations_["K-POP"]        = RadioStation("Only Hit - KPop",        "https://ais-sa3.cdnstream1.com/2630_128.mp3",        "K-POP",  "Pop",      1.5f);
 
+    // Russian MP3 streams
+    radio_stations_["MARUSYAFM"]      = RadioStation("Маруся FM",           "https://msk3.radio-holding.ru/marusya_default",          "Маруся FM",               "Pop/Dance",      1.2f);
+    radio_stations_["RUSSKOE_RADIO"]  = RadioStation("Русское Радио",       "https://rusradio.hostingradio.ru/rusradio96.aacp",     "Русское Радио",           "Pop",            1.0f, STATION_CODEC_AAC);
+    radio_stations_["EUROPA_PLUS"]    = RadioStation("Европа Плюс",         "https://ep256.hostingradio.ru:8052/europaplus256.mp3",   "Европа Плюс",             "Pop/Dance",      1.0f);
+
 
     ESP_LOGI(TAG, "Initialized %d radio stations (MP3)", (int)radio_stations_.size());
+
+    // Load user-defined (custom) stations stored in NVS
+    LoadCustomStationsFromNvs();
 }
 
 bool Esp32Radio::PlayStation(const std::string& station_name) {
@@ -133,6 +188,7 @@ bool Esp32Radio::PlayStation(const std::string& station_name) {
             ESP_LOGI(TAG, "Found station by display name: '%s' -> %s (volume: %.1fx)",
                      station_name.c_str(), station.second.name.c_str(), station.second.volume);
             current_station_volume_ = station.second.volume;
+            current_station_codec_ = station.second.codec;
             return PlayUrl(station.second.url, station.second.name);
         }
     }
@@ -143,6 +199,7 @@ bool Esp32Radio::PlayStation(const std::string& station_name) {
         ESP_LOGI(TAG, "Found station by key: '%s' -> %s (volume: %.1fx)",
                  station_name.c_str(), it->second.name.c_str(), it->second.volume);
         current_station_volume_ = it->second.volume;
+        current_station_codec_ = it->second.codec;
         return PlayUrl(it->second.url, it->second.name);
     }
 
@@ -154,12 +211,216 @@ bool Esp32Radio::PlayStation(const std::string& station_name) {
             ESP_LOGI(TAG, "Found station by key (case-insensitive): '%s' -> %s (volume: %.1fx)",
                      station_name.c_str(), station.second.name.c_str(), station.second.volume);
             current_station_volume_ = station.second.volume;
+            current_station_codec_ = station.second.codec;
             return PlayUrl(station.second.url, station.second.name);
         }
     }
 
     ESP_LOGE(TAG, "Radio station not found: %s", station_name.c_str());
     return false;
+}
+
+bool Esp32Radio::NextStation() {
+    if (radio_stations_.empty()) {
+        ESP_LOGW(TAG, "No stations available");
+        return false;
+    }
+
+    // Build an ordered list of stations (map is ordered by key)
+    std::vector<std::map<std::string, RadioStation>::const_iterator> stations;
+    stations.reserve(radio_stations_.size());
+    for (auto it = radio_stations_.begin(); it != radio_stations_.end(); ++it) {
+        stations.push_back(it);
+    }
+
+    // Find the currently playing station by URL
+    size_t index = 0;
+    bool found = false;
+    for (size_t i = 0; i < stations.size(); ++i) {
+        if (stations[i]->second.url == current_station_url_) {
+            index = i;
+            found = true;
+            break;
+        }
+    }
+
+    size_t next = found ? (index + 1) % stations.size() : 0;
+    const auto& st = stations[next]->second;
+    ESP_LOGI(TAG, "Next station: %s (%s)", st.name.c_str(), st.url.c_str());
+
+    current_station_volume_ = st.volume;
+    current_station_codec_ = st.codec;
+    return PlayUrl(st.url, st.name);
+}
+
+bool Esp32Radio::PreviousStation() {
+    if (radio_stations_.empty()) {
+        ESP_LOGW(TAG, "No stations available");
+        return false;
+    }
+
+    std::vector<std::map<std::string, RadioStation>::const_iterator> stations;
+    stations.reserve(radio_stations_.size());
+    for (auto it = radio_stations_.begin(); it != radio_stations_.end(); ++it) {
+        stations.push_back(it);
+    }
+
+    size_t index = 0;
+    bool found = false;
+    for (size_t i = 0; i < stations.size(); ++i) {
+        if (stations[i]->second.url == current_station_url_) {
+            index = i;
+            found = true;
+            break;
+        }
+    }
+
+    size_t prev = found ? (index + stations.size() - 1) % stations.size() : 0;
+    const auto& st = stations[prev]->second;
+    ESP_LOGI(TAG, "Previous station: %s (%s)", st.name.c_str(), st.url.c_str());
+
+    current_station_volume_ = st.volume;
+    current_station_codec_ = st.codec;
+    return PlayUrl(st.url, st.name);
+}
+
+void Esp32Radio::LoadCustomStationsFromNvs() {
+    Settings settings("radio", true);
+    std::string keys_json = settings.GetString("station_keys", "[]");
+    cJSON* keys_arr = cJSON_Parse(keys_json.c_str());
+    if (!keys_arr || !cJSON_IsArray(keys_arr)) {
+        if (keys_arr) cJSON_Delete(keys_arr);
+        ESP_LOGW(TAG, "Failed to parse station keys from NVS");
+        return;
+    }
+
+    int count = cJSON_GetArraySize(keys_arr);
+    for (int i = 0; i < count; ++i) {
+        cJSON* key_item = cJSON_GetArrayItem(keys_arr, i);
+        if (!key_item || !cJSON_IsString(key_item)) continue;
+        std::string key = key_item->valuestring;
+
+        std::string station_json = settings.GetString("station_" + key, "{}");
+        cJSON* st = cJSON_Parse(station_json.c_str());
+        if (!st || !cJSON_IsObject(st)) {
+            if (st) cJSON_Delete(st);
+            continue;
+        }
+
+        cJSON* name = cJSON_GetObjectItem(st, "name");
+        cJSON* url = cJSON_GetObjectItem(st, "url");
+        cJSON* genre = cJSON_GetObjectItem(st, "genre");
+        cJSON* volume = cJSON_GetObjectItem(st, "volume");
+        cJSON* codec = cJSON_GetObjectItem(st, "codec");
+
+        if (name && url && cJSON_IsString(name) && cJSON_IsString(url)) {
+            radio_stations_[key] = RadioStation(
+                name->valuestring,
+                url->valuestring,
+                genre && cJSON_IsString(genre) ? genre->valuestring : "",
+                "",
+                volume && cJSON_IsNumber(volume) ? (float)volume->valuedouble : 1.0f,
+                codec && cJSON_IsNumber(codec) ? codec->valueint : STATION_CODEC_MP3);
+            saved_station_keys_.insert(key);
+            ESP_LOGI(TAG, "Loaded custom station: %s (%s)", name->valuestring, url->valuestring);
+        }
+        cJSON_Delete(st);
+    }
+    cJSON_Delete(keys_arr);
+    ESP_LOGI(TAG, "Loaded %d custom stations from NVS", count);
+}
+
+std::string Esp32Radio::GetStationsJson() const {
+    cJSON* root = cJSON_CreateArray();
+    for (std::map<std::string, RadioStation>::const_iterator it = radio_stations_.begin();
+         it != radio_stations_.end(); ++it) {
+        const std::string& key = it->first;
+        const RadioStation& station = it->second;
+        cJSON* item = cJSON_CreateObject();
+        cJSON_AddStringToObject(item, "key", key.c_str());
+        cJSON_AddStringToObject(item, "name", station.name.c_str());
+        cJSON_AddStringToObject(item, "url", station.url.c_str());
+        cJSON_AddStringToObject(item, "genre", station.genre.c_str());
+        cJSON_AddNumberToObject(item, "volume", station.volume);
+        cJSON_AddNumberToObject(item, "codec", station.codec);
+        cJSON_AddItemToArray(root, item);
+    }
+    char* json = cJSON_PrintUnformatted(root);
+    std::string result = json ? json : "[]";
+    if (json) cJSON_free(json);
+    cJSON_Delete(root);
+    return result;
+}
+
+bool Esp32Radio::AddOrUpdateStation(const std::string& key, const std::string& name,
+                                    const std::string& url, const std::string& genre,
+                                    float volume, int codec) {
+    if (key.empty() || name.empty() || url.empty()) {
+        ESP_LOGE(TAG, "Invalid station parameters (key/name/url empty)");
+        return false;
+    }
+
+    // Update in-memory map
+    radio_stations_[key] = RadioStation(name, url, "", genre, volume, codec);
+
+    // Persist to NVS
+    Settings settings("radio", true);
+
+    cJSON* st = cJSON_CreateObject();
+    cJSON_AddStringToObject(st, "name", name.c_str());
+    cJSON_AddStringToObject(st, "url", url.c_str());
+    cJSON_AddStringToObject(st, "genre", genre.c_str());
+    cJSON_AddNumberToObject(st, "volume", volume);
+    cJSON_AddNumberToObject(st, "codec", codec);
+    char* st_json = cJSON_PrintUnformatted(st);
+    settings.SetString("station_" + key, st_json ? st_json : "{}");
+    if (st_json) cJSON_free(st_json);
+    cJSON_Delete(st);
+
+    // Remember that this station has an NVS override (so edits to built-in
+    // stations also survive a reboot).
+    saved_station_keys_.insert(key);
+    SaveStationKeysToNvs();
+
+    ESP_LOGI(TAG, "Station '%s' saved to NVS", key.c_str());
+    return true;
+}
+
+// Rebuild the list of station keys that must be restored from NVS on boot.
+void Esp32Radio::SaveStationKeysToNvs() {
+    Settings settings("radio", true);
+    cJSON* keys_arr = cJSON_CreateArray();
+    for (const auto& k : saved_station_keys_) {
+        if (radio_stations_.find(k) != radio_stations_.end()) {
+            cJSON_AddItemToArray(keys_arr, cJSON_CreateString(k.c_str()));
+        }
+    }
+    char* keys_json = cJSON_PrintUnformatted(keys_arr);
+    settings.SetString("station_keys", keys_json ? keys_json : "[]");
+    if (keys_json) cJSON_free(keys_json);
+    cJSON_Delete(keys_arr);
+}
+
+bool Esp32Radio::DeleteStation(const std::string& key) {
+    if (key.rfind("CUSTOM_", 0) != 0) {
+        ESP_LOGW(TAG, "Cannot delete built-in station: %s", key.c_str());
+        return false;
+    }
+
+    auto it = radio_stations_.find(key);
+    if (it == radio_stations_.end()) {
+        return false;
+    }
+
+    radio_stations_.erase(it);
+    saved_station_keys_.erase(key);
+
+    Settings settings("radio", true);
+    settings.EraseKey("station_" + key);
+    SaveStationKeysToNvs();
+
+    ESP_LOGI(TAG, "Station '%s' deleted", key.c_str());
+    return true;
 }
 
 bool Esp32Radio::PlayUrl(const std::string& radio_url, const std::string& station_name) {
@@ -191,11 +452,24 @@ bool Esp32Radio::PlayUrl(const std::string& radio_url, const std::string& statio
         current_station_volume_ = 1.0f; // sensible default
     }
 
+    // Keep the radio at the assistant's current volume. The station volume
+    // multiplier is NOT applied any more: it used to be applied both to the codec
+    // volume and to the PCM samples, which made the radio much louder than the
+    // assistant and also overwrote the saved assistant volume.
+    auto codec_for_volume = Board::GetInstance().GetAudioCodec();
+    if (codec_for_volume && codec_for_volume->output_volume() == 0) {
+        // Playback is resuming: restore the level that was active before muting.
+        codec_for_volume->Unmute();
+        ESP_LOGI(TAG, "Unmuted before radio playback, restored volume %d",
+                 codec_for_volume->output_volume());
+    }
+
     ClearAudioBuffer();
 
-    // Configure pthread
+    // Configure pthread - use a generous stack size for the streaming threads
+    // (MP3 decoding + HTTPS download buffering) to avoid stack overflow panics.
     esp_pthread_cfg_t cfg = esp_pthread_get_default_config();
-    cfg.stack_size = 1024 * 3 + 512;
+    cfg.stack_size = 1024 * 10;
     cfg.prio = 5;
     cfg.thread_name = "radio_stream";
     esp_pthread_set_cfg(&cfg);
@@ -286,20 +560,46 @@ void Esp32Radio::DownloadRadioStream(const std::string& radio_url) {
 
     auto display = Board::GetInstance().GetDisplay();
 
-    if (!http->Open("GET", radio_url)) {
-        ESP_LOGE(TAG, "Failed to connect to radio stream URL: %s", radio_url.c_str());
-        is_downloading_ = false;
-        if (display) display->SetMusicInfo("Radio connection error");
-        return;
+    // Resolve HTTP redirects (many radio providers hand out a load-balancer URL
+    // that answers 307 to the real stream host).
+    std::string stream_url = radio_url;
+    for (int hop = 0; hop < 5; ++hop) {
+        if (!http->Open("GET", stream_url)) {
+            ESP_LOGE(TAG, "Failed to connect to radio stream URL: %s", stream_url.c_str());
+            is_downloading_ = false;
+            if (display) display->SetMusicInfo("Radio connection error");
+            return;
+        }
+
+        int hop_status = http->GetStatusCode();
+        if (hop_status < 300 || hop_status >= 400) {
+            break;  // final response, connection stays open
+        }
+
+        std::string location = http->GetResponseHeader("Location");
+        http->Close();
+        if (location.empty()) {
+            ESP_LOGE(TAG, "HTTP %d redirect without Location header", hop_status);
+            is_downloading_ = false;
+            return;
+        }
+
+        if (location.rfind("http", 0) != 0) {
+            // Relative redirect: rebuild absolute URL from the current one
+            size_t scheme_end = stream_url.find("://");
+            size_t host_end = (scheme_end == std::string::npos)
+                                  ? std::string::npos
+                                  : stream_url.find('/', scheme_end + 3);
+            std::string base = (host_end == std::string::npos) ? stream_url
+                                                               : stream_url.substr(0, host_end);
+            location = base + (location[0] == '/' ? "" : "/") + location;
+        }
+
+        ESP_LOGW(TAG, "HTTP %d redirect -> %s", hop_status, location.c_str());
+        stream_url = location;
     }
 
     int status_code = http->GetStatusCode();
-    if (status_code >= 300 && status_code < 400) {
-        ESP_LOGW(TAG, "HTTP %d redirect detected but cannot follow", status_code);
-        http->Close();
-        is_downloading_ = false;
-        return;
-    }
     if (status_code != 200 && status_code != 206) {
         ESP_LOGE(TAG, "HTTP GET failed with status code: %d", status_code);
         http->Close();
@@ -336,7 +636,7 @@ void Esp32Radio::DownloadRadioStream(const std::string& radio_url) {
             vTaskDelay(pdMS_TO_TICKS(1500));
             http->Close();
 
-            if (!http->Open("GET", radio_url)) {
+            if (!http->Open("GET", stream_url)) {
                 ESP_LOGE(TAG, "Reconnect failed at attempt %d", reconnect_attempts);
                 continue;
             } else {
@@ -464,7 +764,7 @@ void Esp32Radio::PlayRadioStream() {
 
             if (display) {
                 std::string formatted =
-                    "Radio 《" + current_station_name_ + "》 Playing...";
+                    "Radio: " + ToDisplayAscii(current_station_name_) + "\nPlaying...";
                 display->SetMusicInfo(formatted.c_str());
                 station_name_displayed_ = true;
             }
@@ -562,7 +862,7 @@ void Esp32Radio::PlayRadioStream() {
 
                         if (display) {
                             std::ostringstream oss;
-                            oss << "RADIO 《" << current_station_name_ << "》\n"
+                            oss << "RADIO: " << ToDisplayAscii(current_station_name_) << "\n"
                                 << "MP3 " << dec_info_.sample_rate << "Hz  "
                                 << (int)dec_info_.bits_per_sample << "bit  "
                                 << (int)dec_info_.channel << "ch";
@@ -597,17 +897,8 @@ void Esp32Radio::PlayRadioStream() {
                     final_sample_count = total_samples;
                 }
 
-                // Apply station volume amplification
-                std::vector<int16_t> amplified_buffer(final_sample_count);
-                const float amp = current_station_volume_;
-
-                for (int i = 0; i < final_sample_count; ++i) {
-                    int32_t s = (int32_t)(final_pcm_data[i] * amp);
-                    if (s > INT16_MAX) s = INT16_MAX;
-                    if (s < INT16_MIN) s = INT16_MIN;
-                    amplified_buffer[i] = (int16_t)s;
-                }
-
+                // No extra station amplification: the radio plays at the same
+                // level as the assistant (the codec volume already reflects it).
                 AudioStreamPacket packet;
                 packet.sample_rate = dec_info_.sample_rate;
                 packet.frame_duration = 60;
@@ -615,11 +906,11 @@ void Esp32Radio::PlayRadioStream() {
 
                 size_t pcm_size_bytes = (size_t)final_sample_count * sizeof(int16_t);
                 packet.payload.resize(pcm_size_bytes);
-                memcpy(packet.payload.data(), amplified_buffer.data(), pcm_size_bytes);
+                memcpy(packet.payload.data(), final_pcm_data, pcm_size_bytes);
 
                 if (display && display_mode_ == DISPLAY_MODE_SPECTRUM) {
                     final_pcm_data_fft = display->MakeAudioBuffFFT(pcm_size_bytes);
-                    display->FeedAudioDataFFT(amplified_buffer.data(), pcm_size_bytes);
+                    display->FeedAudioDataFFT(final_pcm_data, pcm_size_bytes);
                 }
 
                 app.AddAudioData(std::move(packet));
@@ -713,30 +1004,42 @@ bool Esp32Radio::InitializeDecoder() {
         return true;
     }
 
-    ESP_LOGI(TAG, "Initializing MP3 Simple Decoder for radio streams");
+    ESP_LOGI(TAG, "Initializing MP3/AAC Simple Decoder for radio streams");
 
     esp_audio_dec_register_default();
     esp_audio_simple_dec_register_default();
 
     esp_audio_simple_dec_cfg_t cfg = {};
-    cfg.dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3; // <<< MP3
     cfg.dec_cfg = nullptr;
     cfg.cfg_size = 0;
     cfg.use_frame_dec = false;
 
+    // Select decoder based on the station's known codec (with fallback).
+    bool prefer_aac = (current_station_codec_ == STATION_CODEC_AAC);
+    cfg.dec_type = prefer_aac ? ESP_AUDIO_SIMPLE_DEC_TYPE_AAC
+                              : ESP_AUDIO_SIMPLE_DEC_TYPE_MP3;
     esp_audio_err_t ret = esp_audio_simple_dec_open(&cfg, &decoder_);
     if (ret != ESP_AUDIO_ERR_OK || !decoder_) {
-        ESP_LOGE(TAG, "Failed to open MP3 simple decoder, ret=%d", ret);
-        esp_audio_simple_dec_unregister_default();
-        esp_audio_dec_unregister_default();
-        return false;
+        ESP_LOGW(TAG, "Failed to open %s decoder, trying %s...",
+                 prefer_aac ? "AAC" : "MP3", prefer_aac ? "MP3" : "AAC");
+        cfg.dec_type = prefer_aac ? ESP_AUDIO_SIMPLE_DEC_TYPE_MP3
+                                  : ESP_AUDIO_SIMPLE_DEC_TYPE_AAC;
+        ret = esp_audio_simple_dec_open(&cfg, &decoder_);
+        if (ret != ESP_AUDIO_ERR_OK || !decoder_) {
+            ESP_LOGE(TAG, "Failed to open fallback decoder, ret=%d", ret);
+            esp_audio_simple_dec_unregister_default();
+            esp_audio_dec_unregister_default();
+            return false;
+        }
+        ESP_LOGI(TAG, "%s Simple Decoder initialized (fallback)", prefer_aac ? "MP3" : "AAC");
+    } else {
+        ESP_LOGI(TAG, "%s Simple Decoder initialized", prefer_aac ? "AAC" : "MP3");
     }
 
     dec_out_buffer_.resize(4096);
     dec_info_ready_ = false;
     decoder_initialized_ = true;
 
-    ESP_LOGI(TAG, "MP3 Simple Decoder initialized successfully");
     return true;
 }
 

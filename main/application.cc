@@ -10,6 +10,7 @@
 #include "assets.h"
 #include "settings.h"
 #include "ota_server.h"
+#include "boards/freenove-esp32-s3-lcd-2.8/radio_web_server.h"
 #include "wifi_station.h"
 #include "sd_card.h"
 #include "esp32_sd_music.h"
@@ -458,6 +459,14 @@ void Application::Start() {
         ESP_LOGE(TAG, "Failed to start OTA server");
     }
 
+    // Start the radio management web server (port 8080)
+    auto& radio_web = radio::RadioWebServer::GetInstance();
+    if (radio_web.Start(8080) == ESP_OK) {
+        ESP_LOGI(TAG, "Radio web server started on port 8080");
+    } else {
+        ESP_LOGE(TAG, "Failed to start radio web server");
+    }
+
     // Initialize the protocol
     display->SetStatus(Lang::Strings::LOADING_PROTOCOL);
 
@@ -776,6 +785,16 @@ void Application::SetDeviceState(DeviceState state) {
 
     auto& board = Board::GetInstance();
     auto display = board.GetDisplay();
+
+    // Leaving Idle means playback/chat is resuming (e.g. after a long-press mute):
+    // restore the volume level that was active before muting.
+    if (previous_state == kDeviceStateIdle && state != kDeviceStateIdle) {
+        auto codec = board.GetAudioCodec();
+        if (codec && codec->output_volume() == 0) {
+            codec->Unmute();
+            ESP_LOGI(TAG, "Auto-unmute on resume: volume restored to %d", codec->output_volume());
+        }
+    }
 
 #ifdef CONFIG_WEATHER_IDLE_DISPLAY_ENABLE
     // --- [ADD HIDDEN/SHOWABLE LOGIC FOR IDLE SCREEN] ---

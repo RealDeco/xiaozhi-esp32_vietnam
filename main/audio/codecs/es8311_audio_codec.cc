@@ -154,7 +154,16 @@ void Es8311AudioCodec::CreateDuplexChannels(gpio_num_t mclk, gpio_num_t bclk, gp
 }
 
 void Es8311AudioCodec::SetOutputVolume(int volume) {
-    ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(dev_, volume));
+    // The esp_codec_dev device only exists while input or output is enabled.
+    // In Idle (output disabled) dev_ is nullptr, so setting the volume there must
+    // not abort the firmware: keep the value in the base class and it will be
+    // applied by UpdateDeviceState() when the output is opened again.
+    if (dev_ != nullptr) {
+        esp_err_t err = esp_codec_dev_set_out_vol(dev_, volume);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to set output volume to %d: %s", volume, esp_err_to_name(err));
+        }
+    }
     AudioCodec::SetOutputVolume(volume);
 }
 
@@ -183,14 +192,14 @@ void Es8311AudioCodec::EnableOutput(bool enable) {
 }
 
 int Es8311AudioCodec::Read(int16_t* dest, int samples) {
-    if (input_enabled_) {
+    if (input_enabled_ && dev_ != nullptr) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_read(dev_, (void*)dest, samples * sizeof(int16_t)));
     }
     return samples;
 }
 
 int Es8311AudioCodec::Write(const int16_t* data, int samples) {
-    if (output_enabled_) {
+    if (output_enabled_ && dev_ != nullptr) {
         ESP_ERROR_CHECK_WITHOUT_ABORT(esp_codec_dev_write(dev_, (void*)data, samples * sizeof(int16_t)));
     }
     return samples;
