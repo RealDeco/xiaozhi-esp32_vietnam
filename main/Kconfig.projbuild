@@ -449,6 +449,12 @@ choice BOARD_TYPE
     config BOARD_TYPE_AIPI_LITE
         bool "AIPI-Lite"
         depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_FNK0104B
+        bool "FNK0104B"
+        depends on IDF_TARGET_ESP32S3
+    config BOARD_TYPE_FREENOVE_ESP32_S3_LCD_2_8
+        bool "Freenove ESP32-S3 Display 2.8 inch LCD"
+        depends on IDF_TARGET_ESP32S3
 endchoice
 
 choice

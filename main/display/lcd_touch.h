@@ -48,7 +48,7 @@ protected:
     int32_t swipe_timeout_us_ = 2000000;    // Maximum time for swipe (2 seconds)
     int32_t tap_timeout_us_ = 170000;       // Maximum time for tap (170ms)
     int32_t double_tap_window_us_ = 500000; // Window for double tap (500ms)
-    int32_t long_press_time_us_ = 800000;   // Time for long press (800ms)
+    int32_t long_press_time_us_ = 3000000;   // Time for long press (3 seconds)
     int32_t release_timeout_us_ = TOUCH_RELEASE_TIMEOUT;    // Time to confirm release (10ms)
     
     // Touch state tracking

@@ -6,6 +6,7 @@
 #include "mcp_server.h"
 #include <esp_log.h>
 #include <esp_app_desc.h>
+#include <sdkconfig.h>
 #include <algorithm>
 #include <cstring>
 #include <esp_pthread.h>
@@ -1147,6 +1148,37 @@ void McpServer::AddUserOnlyTools() {
             });
             
             return true;
+        });
+
+    // OTA update server URL (persisted in NVS, used on every boot)
+    AddUserOnlyTool("self.system.set_ota_url",
+        "Set the OTA version-check URL. The device checks this URL on every boot "
+        "and updates itself when a newer firmware is offered. Use \"default\" to reset.",
+        PropertyList({
+            Property("url", kPropertyTypeString)
+        }),
+        [](const PropertyList& properties) -> ReturnValue {
+            auto url = properties["url"].value<std::string>();
+            Settings settings("wifi", true);
+            if (url.empty() || url == "default" || url == "reset") {
+                settings.SetString("ota_url", "");
+                ESP_LOGI(TAG, "OTA url reset to default (%s)", CONFIG_OTA_URL);
+                return true;
+            }
+            settings.SetString("ota_url", url);
+            ESP_LOGI(TAG, "OTA url set to %s", url.c_str());
+            return true;
+        });
+
+    AddTool("self.system.get_ota_url", "Get the OTA version-check URL",
+        PropertyList(),
+        [](const PropertyList& properties) -> ReturnValue {
+            Settings settings("wifi", false);
+            std::string url = settings.GetString("ota_url");
+            if (url.empty()) {
+                url = CONFIG_OTA_URL;
+            }
+            return url;
         });
 
     // Display control

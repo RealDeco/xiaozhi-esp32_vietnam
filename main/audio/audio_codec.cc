@@ -28,11 +28,16 @@ bool AudioCodec::InputData(std::vector<int16_t>& data) {
 
 void AudioCodec::Start() {
     Settings settings("audio", false);
-    output_volume_ = settings.GetInt("output_volume", output_volume_);
-    if (output_volume_ <= 0) {
-        ESP_LOGW(TAG, "Output volume value (%d) is too small, setting to default (10)", output_volume_);
-        output_volume_ = 10;
+    // Default to a comfortable 70% when nothing has been saved yet; a stored 0
+    // means the user muted the device, which is a valid state and must survive.
+    output_volume_ = settings.GetInt("output_volume", 70);
+    if (output_volume_ < 0) {
+        output_volume_ = 70;
     }
+    if (output_volume_ > 100) {
+        output_volume_ = 100;
+    }
+    ESP_LOGI(TAG, "Output volume: %d", output_volume_);
 
     // 保存原始输出采样率
     if (original_output_sample_rate_ == 0) {
@@ -54,11 +59,22 @@ void AudioCodec::Start() {
 }
 
 void AudioCodec::SetOutputVolume(int volume) {
+    if (volume == 0) {
+        // Muting: remember the level that should be restored when unmuting.
+        if (output_volume_ > 0) {
+            last_unmuted_volume_ = output_volume_;
+        }
+    }
     output_volume_ = volume;
     ESP_LOGI(TAG, "Set output volume to %d", output_volume_);
     
     Settings settings("audio", true);
     settings.SetInt("output_volume", output_volume_);
+}
+
+void AudioCodec::Unmute() {
+    // Restore the volume level that was active before muting.
+    SetOutputVolume(last_unmuted_volume_);
 }
 
 void AudioCodec::SetInputGain(float gain) {

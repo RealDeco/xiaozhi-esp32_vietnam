@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <vector>
+#include <set>
 #include <map>
 #include <cstdint>
 
@@ -28,6 +29,12 @@ struct RadioAudioChunk {
     RadioAudioChunk(uint8_t* d, size_t s) : data(d), size(s) {}
 };
 
+// Radio station codec type
+enum StationCodec {
+    STATION_CODEC_MP3 = 0,
+    STATION_CODEC_AAC = 1,
+};
+
 // Radio station information structure
 struct RadioStation {
     std::string name;        // Station name
@@ -35,12 +42,13 @@ struct RadioStation {
     std::string description; // Description
     std::string genre;       // Genre
     float volume;            // Amplification factor (1.0 = 100%)
+    int codec;               // StationCodec: MP3 or AAC
 
-    RadioStation() : volume(1.0f) {}
+    RadioStation() : volume(1.0f), codec(STATION_CODEC_MP3) {}
     RadioStation(const std::string& n, const std::string& u,
                  const std::string& d = "", const std::string& g = "",
-                 float v = 1.0f)
-        : name(n), url(u), description(d), genre(g), volume(v) {}
+                 float v = 1.0f, int c = STATION_CODEC_MP3)
+        : name(n), url(u), description(d), genre(g), volume(v), codec(c) {}
 };
 
 class Esp32Radio : public Radio {
@@ -55,8 +63,12 @@ private:
     std::string current_station_url_;
     bool station_name_displayed_;
     float current_station_volume_;
+    std::atomic<int> current_station_codec_;
 
     std::map<std::string, RadioStation> radio_stations_;
+    // Keys of stations that have an override saved in NVS (custom + edited built-ins)
+    std::set<std::string> saved_station_keys_;
+    void SaveStationKeysToNvs();
 
     std::atomic<DisplayMode> display_mode_;
     std::atomic<bool> is_playing_;
@@ -81,6 +93,7 @@ private:
 
     // Private methods
     void InitializeRadioStations();
+    void LoadCustomStationsFromNvs();
     void DownloadRadioStream(const std::string& radio_url);
     void PlayRadioStream();
     void ClearAudioBuffer();
@@ -101,10 +114,25 @@ public:
 
     void Initialize();
 
+    // On-screen text: the built-in LVGL fonts have no Cyrillic glyphs,
+    // so Russian names are transliterated to Latin for the LCD only.
+    static std::string ToDisplayAscii(const std::string& text);
+
     virtual bool PlayStation(const std::string& station_name) override;
     virtual bool PlayUrl(const std::string& radio_url, const std::string& station_name = "") override;
     virtual bool Stop() override;
     virtual std::vector<std::string> GetStationList() const override;
+
+    // Cycle through the station list
+    bool NextStation();
+    bool PreviousStation();
+
+    // Web UI: station management
+    std::string GetStationsJson() const;                                       // all stations as JSON
+    bool AddOrUpdateStation(const std::string& key, const std::string& name,   // add / edit custom station
+                            const std::string& url, const std::string& genre,
+                            float volume, int codec);
+    bool DeleteStation(const std::string& key);                                // delete custom station
 
     virtual bool IsPlaying() const override { return is_playing_; }
     virtual std::string GetCurrentStation() const override { return current_station_name_; }
