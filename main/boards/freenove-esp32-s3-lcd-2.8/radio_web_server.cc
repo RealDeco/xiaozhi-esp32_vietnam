@@ -141,6 +141,24 @@ const char* kRadioPageHtml = R"rawliteral(
   <div id="rotMsg" class="msg hidden"></div>
 </div>
 
+<div class="card">
+  <div class="section-title">🌤️ Погода на экране ожидания</div>
+  <label>Город (OpenWeatherMap)</label>
+  <input type="text" id="weatherCity" placeholder="Краснодар">
+  <label>API-ключ OpenWeatherMap (необязательно)</label>
+  <input type="text" id="weatherApiKey" placeholder="оставьте пустым, чтобы не менять">
+  <div class="row">
+    <button type="button" class="btn btn-primary" id="weatherSaveBtn">Сохранить</button>
+    <button type="button" class="btn btn-secondary" id="weatherAutoBtn">Авто (по IP)</button>
+  </div>
+  <div style="font-size:12px;color:#6b7280;margin-top:8px">
+    Город задаёт местоположение для погоды в режиме ожидания (например: Краснодар).
+    «Авто» — определение по IP. Изменения применятся при следующем обновлении погоды
+    или после перезагрузки устройства.
+  </div>
+  <div id="weatherMsg" class="msg hidden"></div>
+</div>
+
 <script>
 let stations = [];
 let editingKey = null;
@@ -356,9 +374,50 @@ document.querySelectorAll('.rot-btn').forEach((btn) => {
   btn.addEventListener('click', () => setRotation(Number(btn.dataset.deg)));
 });
 
+// --- Weather -----------------------------------------------------------------
+function showWeatherMsg(text, ok) {
+  const el = document.getElementById('weatherMsg');
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.classList.remove('hidden');
+  setTimeout(() => el.classList.add('hidden'), 4000);
+}
+
+async function loadWeather() {
+  try {
+    const res = await fetch('/radio/api/weather');
+    const data = await res.json();
+    document.getElementById('weatherCity').value = data.city || '';
+    document.getElementById('weatherApiKey').value = '';
+    document.getElementById('weatherApiKey').placeholder = data.has_api_key
+      ? 'ключ сохранён (введите новый, чтобы заменить)' : 'оставьте пустым, чтобы не менять';
+  } catch (e) { /* сервер не готов */ }
+}
+
+async function saveWeather(city, apiKey) {
+  try {
+    const body = { city };
+    if (apiKey && apiKey.length) body.api_key = apiKey;
+    const res = await fetch('/radio/api/weather', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
+    showWeatherMsg('Сохранено: ' + (data.city || 'авто по IP') + '. Обновится при следующем запросе погоды или после перезагрузки.', true);
+    loadWeather();
+  } catch (e) { showWeatherMsg('Ошибка: ' + e.message, false); }
+}
+
+document.getElementById('weatherSaveBtn').addEventListener('click', () =>
+  saveWeather(document.getElementById('weatherCity').value, document.getElementById('weatherApiKey').value));
+document.getElementById('weatherAutoBtn').addEventListener('click', () => saveWeather('', ''));
+
 loadStations();
 loadOtaUrl();
 loadRotation();
+loadWeather();
 </script>
 
 </body>
@@ -427,6 +486,7 @@ esp_err_t RadioWebServer::Start(int port) {
   config.ctrl_port = port + 1024;  // avoid clash with OTA
   config.stack_size = 8192;
   config.lru_purge_enable = true;  // close least-recently-used socket instead of failing
+  config.max_uri_handlers = 12;     // index + stations*4 + ota*2 + rotation + weather
 
   esp_err_t err = httpd_start(&server_handle_, &config);
   if (err != ESP_OK) {
@@ -501,6 +561,17 @@ esp_err_t RadioWebServer::Start(int port) {
   esp_err_t rot_err = httpd_register_uri_handler(server_handle_, &rotation);
   if (rot_err != ESP_OK) {
     ESP_LOGE(kTag, "Failed to register /radio/api/rotation: %s", esp_err_to_name(rot_err));
+  }
+
+  httpd_uri_t weather = {
+    .uri = "/radio/api/weather",
+    .method = (httpd_method_t)HTTP_ANY,
+    .handler = HandleWeatherAny,
+    .user_ctx = nullptr
+  };
+  esp_err_t w_err = httpd_register_uri_handler(server_handle_, &weather);
+  if (w_err != ESP_OK) {
+    ESP_LOGE(kTag, "Failed to register /radio/api/weather: %s", esp_err_to_name(w_err));
   }
 
   ESP_LOGI(kTag, "Radio web server started on port %d", port);
@@ -647,6 +718,71 @@ esp_err_t RadioWebServer::HandleRotationPost(httpd_req_t* req) {
   cJSON_AddBoolToObject(out, "success", true);
   cJSON_AddNumberToObject(out, "rotation", degree);
   cJSON_AddBoolToObject(out, "reboot_required", reboot_required);
+  esp_err_t r = SendJson(req, out);
+  cJSON_Delete(out);
+  return r;
+}
+
+esp_err_t RadioWebServer::HandleWeatherAny(httpd_req_t* req) {
+  switch (req->method) {
+    case HTTP_GET:
+      return HandleWeatherGet(req);
+    case HTTP_POST:
+      return HandleWeatherPost(req);
+    default:
+      return httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, "method not allowed");
+  }
+}
+
+esp_err_t RadioWebServer::HandleWeatherGet(httpd_req_t* req) {
+  Settings settings("wifi", false);
+  std::string city = settings.GetString("weather_city", "");
+  std::string api_key = settings.GetString("weather_api_key", "");
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddStringToObject(root, "city", city.c_str());
+  cJSON_AddBoolToObject(root, "has_api_key", !api_key.empty());
+#if CONFIG_WEATHER_IDLE_DISPLAY_ENABLE
+  cJSON_AddBoolToObject(root, "supported", true);
+#else
+  cJSON_AddBoolToObject(root, "supported", false);
+#endif
+  esp_err_t r = SendJson(req, root);
+  cJSON_Delete(root);
+  return r;
+}
+
+esp_err_t RadioWebServer::HandleWeatherPost(httpd_req_t* req) {
+  std::string body = ReadBody(req);
+  cJSON* root = cJSON_Parse(body.c_str());
+  cJSON* city_item = root ? cJSON_GetObjectItem(root, "city") : nullptr;
+  cJSON* key_item = root ? cJSON_GetObjectItem(root, "api_key") : nullptr;
+
+  std::string city = cJSON_IsString(city_item) ? city_item->valuestring : "";
+  bool set_key = cJSON_IsString(key_item);
+  std::string api_key = set_key ? key_item->valuestring : "";
+  if (root) cJSON_Delete(root);
+
+  auto trim = [](std::string& v) {
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t' || v.front() == '\r' || v.front() == '\n')) v.erase(v.begin());
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t' || v.back() == '\r' || v.back() == '\n')) v.pop_back();
+  };
+  trim(city);
+  trim(api_key);
+
+  {
+    Settings settings("wifi", true);
+    settings.SetString("weather_city", city);
+    if (set_key) {
+      settings.SetString("weather_api_key", api_key);
+    }
+  }
+
+  ESP_LOGI(kTag, "Weather settings saved: city='%s'%s", city.c_str(), set_key ? ", api_key updated" : "");
+
+  cJSON* out = cJSON_CreateObject();
+  cJSON_AddBoolToObject(out, "success", true);
+  cJSON_AddStringToObject(out, "city", city.c_str());
+  cJSON_AddBoolToObject(out, "has_api_key", !api_key.empty() || !set_key);
   esp_err_t r = SendJson(req, out);
   cJSON_Delete(out);
   return r;

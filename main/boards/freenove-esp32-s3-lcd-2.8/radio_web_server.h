@@ -56,6 +56,12 @@ class RadioWebServer {
   static esp_err_t HandleRotationAny(httpd_req_t* req);
   static esp_err_t HandleRotationGet(httpd_req_t* req);
   static esp_err_t HandleRotationPost(httpd_req_t* req);
+
+  // GET  /radio/api/weather  -> current weather settings (city/api key)
+  // POST /radio/api/weather  -> set weather settings (JSON body {"city":"...","api_key":"..."})
+  static esp_err_t HandleWeatherAny(httpd_req_t* req);
+  static esp_err_t HandleWeatherGet(httpd_req_t* req);
+  static esp_err_t HandleWeatherPost(httpd_req_t* req);
 };
 
 }  // namespace radio
