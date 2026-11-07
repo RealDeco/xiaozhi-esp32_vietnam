@@ -551,6 +551,14 @@ void LcdDisplay::Unlock() {
 void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
 
+    // Apply the saved rotation before laying out the UI so that LV_HOR_RES /
+    // LV_VER_RES (and therefore every container) match the rotated screen.
+    Settings rotation_settings("display", false);
+    int rotation_degree = rotation_settings.GetInt("rotation_degree", 0);
+    if (rotation_degree != 0) {
+        SetRotation(rotation_degree, false);
+    }
+
     auto lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto text_font = lvgl_theme->text_font()->font();
     auto icon_font = lvgl_theme->icon_font()->font();
@@ -664,12 +672,6 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(emoji_label_, large_icon_font, 0);
     lv_obj_set_style_text_color(emoji_label_, lvgl_theme->text_color(), 0);
     lv_label_set_text(emoji_label_, FONT_AWESOME_MICROCHIP_AI);
-
-    Settings settings("display", false);
-    int rotation_degree = settings.GetInt("rotation_degree", 0);
-    if (rotation_degree != 0) {
-        SetRotation(rotation_degree, false);
-    }
 
 #ifdef CONFIG_WEATHER_IDLE_DISPLAY_ENABLE
     if (weather_ui_) {
@@ -962,6 +964,15 @@ void LcdDisplay::SetPreviewImage(std::unique_ptr<LvglImage> image) {
 #else
 void LcdDisplay::SetupUI() {
     DisplayLockGuard lock(this);
+
+    // Apply the saved rotation before laying out the UI so that LV_HOR_RES /
+    // LV_VER_RES (and therefore every container) match the rotated screen.
+    Settings rotation_settings("display", false);
+    int rotation_degree = rotation_settings.GetInt("rotation_degree", 0);
+    if (rotation_degree != 0) {
+        SetRotation(rotation_degree, false);
+    }
+
     LvglTheme* lvgl_theme = static_cast<LvglTheme*>(current_theme_);
     auto text_font = lvgl_theme->text_font()->font();
     auto icon_font = lvgl_theme->icon_font()->font();
@@ -1079,12 +1090,6 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(low_battery_label_, lv_color_white(), 0);
     lv_obj_center(low_battery_label_);
     lv_obj_add_flag(low_battery_popup_, LV_OBJ_FLAG_HIDDEN);
-
-    Settings settings("display", false);
-    int rotation_degree = settings.GetInt("rotation_degree", 0);
-    if (rotation_degree != 0) {
-        SetRotation(rotation_degree, false);
-    }
 
 #ifdef CONFIG_WEATHER_IDLE_DISPLAY_ENABLE
     if (weather_ui_) {
@@ -1881,9 +1886,9 @@ void LcdDisplay::periodicUpdateTask() {
                 drawSpectrumIfReady();
                 lv_area_t refresh_area;
                 refresh_area.x1 = 0;
-                refresh_area.y1 = height_ - bar_max_hight_;
+                refresh_area.y1 = canvas_height_ - bar_max_hight_;
                 refresh_area.x2 = canvas_width_ - 1;
-                refresh_area.y2 = height_ - 1; // Only refresh the spectrum area
+                refresh_area.y2 = canvas_height_ - 1; // Only refresh the spectrum area
                 lv_obj_invalidate_area(canvas_, &refresh_area);
                 fft_data_ready = false;
                 lastDisplayTime = currentTime;
@@ -2011,9 +2016,13 @@ void LcdDisplay::create_canvas(int32_t status_bar_height) {
     }
 
     // int status_bar_height=lv_obj_get_height(status_bar_);
+    // Canvas must match the *rotated* logical resolution, not the physical panel
+    // width/height, otherwise the drawing area is cropped in landscape mode.
+    lv_coord_t logical_width = lv_display_get_horizontal_resolution(display_);
+    lv_coord_t logical_height = lv_display_get_vertical_resolution(display_);
     ESP_LOGI(TAG, "Status bar height: %d", status_bar_height);
-    canvas_width_=width_;
-    canvas_height_=height_-status_bar_height;
+    canvas_width_ = logical_width;
+    canvas_height_ = logical_height - status_bar_height;
     ESP_LOGI(TAG, "Creating canvas with width: %d, height: %d", canvas_width_, canvas_height_);
 
     canvas_buffer_=(uint16_t*)heap_caps_malloc(canvas_width_ * canvas_height_ * sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);

@@ -71,6 +71,7 @@ protected:
     bool mirror_y_;
     uint16_t width_;
     uint16_t height_;
+    int rotation_degree_ = 0;  // Display rotation (0/90/180/270), gestures follow it
     TouchInterruptCallback interrupt_callback_ = nullptr;
 
 public:
@@ -99,6 +100,7 @@ public:
     
 protected:
     // Internal gesture detection methods
+    virtual void ApplyRotation(int16_t& x, int16_t& y) const;
     virtual TouchGesture DetectSwipeGesture();
     virtual void HandleTouchPress(int16_t x, int16_t y);
     virtual void HandleTouchRefresh(int16_t x, int16_t y);

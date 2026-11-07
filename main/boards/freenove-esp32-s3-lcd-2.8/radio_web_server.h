@@ -50,6 +50,12 @@ class RadioWebServer {
   // POST /radio/api/ota  -> set OTA version-check URL (JSON body {"url": "..."})
   static esp_err_t HandleOtaUrlGet(httpd_req_t* req);
   static esp_err_t HandleOtaUrlPost(httpd_req_t* req);
+
+  // GET  /radio/api/rotation  -> current screen rotation (0/90/180/270)
+  // POST /radio/api/rotation  -> set screen rotation (JSON body {"rotation": 90})
+  static esp_err_t HandleRotationAny(httpd_req_t* req);
+  static esp_err_t HandleRotationGet(httpd_req_t* req);
+  static esp_err_t HandleRotationPost(httpd_req_t* req);
 };
 
 }  // namespace radio

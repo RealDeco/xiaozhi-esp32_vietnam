@@ -2,9 +2,13 @@
 
 #include <esp_log.h>
 #include <esp_http_server.h>
+#include <esp_system.h>
+#include <esp_timer.h>
 #include <cJSON.h>
 
 #include "application.h"
+#include "board.h"
+#include "display.h"
 #include "features/music/esp32_radio.h"
 #include "settings.h"
 
@@ -120,6 +124,21 @@ const char* kRadioPageHtml = R"rawliteral(
     <code>http://IP-устройства/ota</code>.
   </div>
   <div id="otaMsg" class="msg hidden"></div>
+</div>
+
+<div class="card">
+  <div class="section-title">🖥️ Поворот экрана</div>
+  <div class="row" id="rotationRow">
+    <button type="button" class="btn btn-secondary rot-btn" data-deg="0">0°</button>
+    <button type="button" class="btn btn-secondary rot-btn" data-deg="90">90° ↻</button>
+    <button type="button" class="btn btn-secondary rot-btn" data-deg="180">180°</button>
+    <button type="button" class="btn btn-secondary rot-btn" data-deg="270">270° ↺</button>
+  </div>
+  <div style="font-size:12px;color:#6b7280;margin-top:8px">
+    Поворот интерфейса на экране устройства (0/90/180/270). Настройка сохраняется
+    в NVS и применяется при загрузке; после смены угла плата перезагрузится.
+  </div>
+  <div id="rotMsg" class="msg hidden"></div>
 </div>
 
 <script>
@@ -293,8 +312,53 @@ document.getElementById('otaSaveBtn').addEventListener('click',
   () => saveOtaUrl(document.getElementById('otaUrl').value.trim()));
 document.getElementById('otaResetBtn').addEventListener('click', () => saveOtaUrl(''));
 
+// --- Screen rotation ---------------------------------------------------------
+function showRotMsg(text, ok) {
+  const el = document.getElementById('rotMsg');
+  el.textContent = text;
+  el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.classList.remove('hidden');
+  setTimeout(() => el.classList.add('hidden'), 4000);
+}
+
+function highlightRotation(deg) {
+  document.querySelectorAll('.rot-btn').forEach((btn) => {
+    const active = Number(btn.dataset.deg) === deg;
+    btn.className = 'btn rot-btn ' + (active ? 'btn-primary' : 'btn-secondary');
+  });
+}
+
+async function loadRotation() {
+  try {
+    const res = await fetch('/radio/api/rotation');
+    const data = await res.json();
+    highlightRotation(data.rotation || 0);
+  } catch (e) { /* сервер ещё не готов */ }
+}
+
+async function setRotation(deg) {
+  try {
+    const res = await fetch('/radio/api/rotation', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ rotation: deg })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) throw new Error(data.error || ('HTTP ' + res.status));
+    highlightRotation(data.rotation);
+    showRotMsg(data.reboot_required
+      ? 'Поворот: ' + data.rotation + '°. Устройство перезагружается…'
+      : 'Поворот экрана: ' + data.rotation + '°', true);
+  } catch (e) { showRotMsg('Ошибка: ' + e.message, false); }
+}
+
+document.querySelectorAll('.rot-btn').forEach((btn) => {
+  btn.addEventListener('click', () => setRotation(Number(btn.dataset.deg)));
+});
+
 loadStations();
 loadOtaUrl();
+loadRotation();
 </script>
 
 </body>
@@ -426,6 +490,19 @@ esp_err_t RadioWebServer::Start(int port) {
   };
   httpd_register_uri_handler(server_handle_, &ota_url_post);
 
+  // esp_http_server allows CONFIG_HTTPD_MAX_URI_HANDLERS (8 by default)
+  // registrations; GET and POST share one handler to stay within the limit.
+  httpd_uri_t rotation = {
+    .uri = "/radio/api/rotation",
+    .method = (httpd_method_t)HTTP_ANY,
+    .handler = HandleRotationAny,
+    .user_ctx = nullptr
+  };
+  esp_err_t rot_err = httpd_register_uri_handler(server_handle_, &rotation);
+  if (rot_err != ESP_OK) {
+    ESP_LOGE(kTag, "Failed to register /radio/api/rotation: %s", esp_err_to_name(rot_err));
+  }
+
   ESP_LOGI(kTag, "Radio web server started on port %d", port);
   return ESP_OK;
 }
@@ -496,6 +573,80 @@ esp_err_t RadioWebServer::HandleOtaUrlPost(httpd_req_t* req) {
   cJSON_AddBoolToObject(out, "success", true);
   cJSON_AddStringToObject(out, "url", reset ? "" : value.c_str());
   cJSON_AddBoolToObject(out, "reboot_required", true);
+  esp_err_t r = SendJson(req, out);
+  cJSON_Delete(out);
+  return r;
+}
+
+esp_err_t RadioWebServer::HandleRotationAny(httpd_req_t* req) {
+  switch (req->method) {
+    case HTTP_GET:
+      return HandleRotationGet(req);
+    case HTTP_POST:
+      return HandleRotationPost(req);
+    default:
+      return httpd_resp_send_err(req, HTTPD_405_METHOD_NOT_ALLOWED, "method not allowed");
+  }
+}
+
+esp_err_t RadioWebServer::HandleRotationGet(httpd_req_t* req) {
+  Settings settings("display", false);
+  int degree = settings.GetInt("rotation_degree", 0);
+  cJSON* root = cJSON_CreateObject();
+  cJSON_AddNumberToObject(root, "rotation", degree);
+  cJSON_AddBoolToObject(root, "supported", Board::GetInstance().GetDisplay() != nullptr);
+  esp_err_t r = SendJson(req, root);
+  cJSON_Delete(root);
+  return r;
+}
+
+esp_err_t RadioWebServer::HandleRotationPost(httpd_req_t* req) {
+  std::string body = ReadBody(req);
+  cJSON* root = cJSON_Parse(body.c_str());
+  cJSON* item = root ? cJSON_GetObjectItem(root, "rotation") : nullptr;
+  if (!cJSON_IsNumber(item)) {
+    if (root) cJSON_Delete(root);
+    return SendOtaError(req, "expected JSON body: {\"rotation\": 0|90|180|270}");
+  }
+
+  int degree = item->valueint;
+  cJSON_Delete(root);
+
+  if (degree != 0 && degree != 90 && degree != 180 && degree != 270) {
+    return SendOtaError(req, "rotation must be 0, 90, 180 or 270");
+  }
+
+  auto display = Board::GetInstance().GetDisplay();
+  if (display == nullptr) {
+    return SendOtaError(req, "display not available");
+  }
+
+  Settings prev_settings("display", false);
+  int previous = prev_settings.GetInt("rotation_degree", 0);
+
+  if (!display->SetRotation(degree, true)) {
+    return SendOtaError(req, "rotation is not supported by this display");
+  }
+
+  ESP_LOGI(kTag, "Screen rotation set to %d degrees (saved)", degree);
+
+  // The UI containers are laid out for the current logical resolution, so a
+  // rotation change needs a reboot to rebuild the layout correctly.
+  bool reboot_required = (previous != degree);
+  if (reboot_required) {
+    esp_timer_create_args_t timer_args = {};
+    timer_args.callback = [](void*) { esp_restart(); };
+    timer_args.name = "rotation_reboot";
+    esp_timer_handle_t timer = nullptr;
+    if (esp_timer_create(&timer_args, &timer) == ESP_OK) {
+      esp_timer_start_once(timer, 1500 * 1000);
+    }
+  }
+
+  cJSON* out = cJSON_CreateObject();
+  cJSON_AddBoolToObject(out, "success", true);
+  cJSON_AddNumberToObject(out, "rotation", degree);
+  cJSON_AddBoolToObject(out, "reboot_required", reboot_required);
   esp_err_t r = SendJson(req, out);
   cJSON_Delete(out);
   return r;

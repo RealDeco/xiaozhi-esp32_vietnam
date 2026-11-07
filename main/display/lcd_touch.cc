@@ -2,6 +2,7 @@
 #include <esp_log.h>
 #include <esp_timer.h>
 #include <cmath>
+#include "settings.h"
 
 static const char* TAG = "LcdTouch";
 
@@ -24,6 +25,16 @@ LcdTouch::LcdTouch(esp_lcd_touch_handle_t touch_handle, esp_lcd_panel_io_handle_
 {
     ESP_LOGI(TAG, "LcdTouch initialized: %dx%d, swap_xy=%d, mirror_x=%d, mirror_y=%d",
              width_, height_, swap_xy_, mirror_x_, mirror_y_);
+
+    // The gesture handler works in screen coordinates, so it has to follow the
+    // same rotation as the display (stored in NVS, applied on boot).
+    {
+        Settings settings("display", false);
+        rotation_degree_ = settings.GetInt("rotation_degree", 0);
+        if (rotation_degree_ != 0) {
+            ESP_LOGI(TAG, "Touch gestures rotated to %d degrees", rotation_degree_);
+        }
+    }
 
 #ifdef LVGL_PORT_TOUCH_DRIVER_CALLBACK
     const lvgl_port_touch_cfg_t touch_cfg = {
@@ -102,9 +113,13 @@ void LcdTouch::touch_driver_read(lv_indev_t *drv, lv_indev_data_t *data) {
     ESP_LOGD(TAG, "Touch points detected: %d, at (%d, %d)", touch_cnt, point_data[0].x, point_data[0].y);
 
     if (err == ESP_OK && touch_cnt > 0 && touch_cnt <= TOUCH_MAX_POINT) {
+        int16_t tx = static_cast<int16_t>(point_data[0].x);
+        int16_t ty = static_cast<int16_t>(point_data[0].y);
+        ApplyRotation(tx, ty);
+
         data->state = LV_INDEV_STATE_PRESSED;
-        data->point.x = point_data[0].x;
-        data->point.y = point_data[0].y;
+        data->point.x = tx;
+        data->point.y = ty;
         int64_t current_time = esp_timer_get_time();
         if (current_time - touch_end_time_ > TOUCH_SWIPE_RELEASE_TIMEOUT) {
             release_timeout_us_ = TOUCH_RELEASE_TIMEOUT;
@@ -113,8 +128,8 @@ void LcdTouch::touch_driver_read(lv_indev_t *drv, lv_indev_data_t *data) {
         }
         touch_end_time_ = current_time;
         
-        int16_t current_x = static_cast<int16_t>(point_data[0].x);
-        int16_t current_y = static_cast<int16_t>(point_data[0].y);
+        int16_t current_x = tx;
+        int16_t current_y = ty;
         
         // Handle touch press (start of touch)
         if (!was_touching_) {
@@ -172,6 +187,29 @@ void LcdTouch::touch_driver_read(lv_indev_t *drv, lv_indev_data_t *data) {
     }
 
     data->continue_reading = true;
+}
+
+void LcdTouch::ApplyRotation(int16_t& x, int16_t& y) const {
+    const int16_t raw_x = x;
+    const int16_t raw_y = y;
+    switch (rotation_degree_) {
+        case 90:
+            // Native portrait (width_ x height_) -> logical landscape (height_ x width_)
+            x = static_cast<int16_t>(height_ - 1 - raw_y);
+            y = raw_x;
+            break;
+        case 180:
+            x = static_cast<int16_t>(width_ - 1 - raw_x);
+            y = static_cast<int16_t>(height_ - 1 - raw_y);
+            break;
+        case 270:
+            // Hardware rotation (esp_lvgl_port, sw_rotate=0) transposes the axes
+            x = raw_y;
+            y = raw_x;
+            break;
+        default:
+            break;
+    }
 }
 
 void LcdTouch::HandleTouchPress(int16_t x, int16_t y) {
